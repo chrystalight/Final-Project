@@ -2,7 +2,8 @@
 
 Pairs with calibration_logger/calibration_logger.ino. Enter the ADS1115
 channel and the volumes of water and dye in the sample, press Record, and the
-Arduino streams that channel's voltage for the trial duration. Each trial is
+Arduino streams that channel's voltage for the trial duration, plotted live
+as it arrives. Each trial is
 saved to its own CSV (channel and volumes in the filename) and appended to
 opt101_calibration_summary.csv with the dye fraction dye / (water + dye), and
 the GUI shows the trial's mean and standard deviation.
@@ -11,6 +12,7 @@ Requires: pip install pyserial
 """
 
 import csv
+import math
 import queue
 import re
 import statistics
@@ -50,6 +52,103 @@ def parse_volume(text, name, allow_zero):
     return value
 
 
+def nice_ticks(lo, hi, target=5):
+    """Round tick values covering lo..hi, and the decimals needed to label them."""
+    raw = (hi - lo) / target
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    decimals = max(0, -math.floor(math.log10(step)))
+    first = math.ceil(lo / step) * step
+    count = int((hi - first) / step + 1e-9) + 1
+    return [first + i * step for i in range(count)], decimals
+
+
+class LivePlot(ttk.Frame):
+    """Voltage-vs-time plot drawn on a Tk canvas, redrawn as samples arrive."""
+
+    LEFT, RIGHT, TOP, BOTTOM = 70, 14, 12, 38
+    TRACE = "#1f5fbf"
+    MEAN = "#d0661c"
+    MIN_SPAN_V = 0.002  # never zoom in tighter than 2 mV
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, width=700, height=260, bg="white", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _e: self.draw())
+        self.times, self.volts = [], []
+        self.duration = 10.0
+        self.mean = None
+
+    def reset(self, duration):
+        self.times, self.volts, self.duration, self.mean = [], [], duration, None
+        self.draw()
+
+    def set_data(self, times, volts, mean=None):
+        self.times, self.volts, self.mean = times, volts, mean
+        self.draw()
+
+    def draw(self):
+        c = self.canvas
+        c.delete("all")
+        w, h = c.winfo_width(), c.winfo_height()
+        if w < 50 or h < 50:
+            return
+        x0, x1 = self.LEFT, w - self.RIGHT
+        y0, y1 = self.TOP, h - self.BOTTOM  # y0 is the top edge
+        c.create_rectangle(x0, y0, x1, y1, outline="#999")
+
+        def xmap(t):
+            return x0 + min(max(t / self.duration, 0.0), 1.0) * (x1 - x0)
+
+        ticks, decimals = nice_ticks(0, self.duration, 6)
+        for t in ticks:
+            x = xmap(t)
+            c.create_line(x, y1, x, y1 + 4, fill="#666")
+            c.create_text(x, y1 + 6, text=f"{t:.{decimals}f}", anchor="n", fill="#333")
+        c.create_text((x0 + x1) / 2, h - 2, text="Time (s)", anchor="s", fill="#333")
+
+        if not self.volts:
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text="Press Record to start a trial", fill="#888")
+            return
+
+        lo, hi = min(self.volts), max(self.volts)
+        if hi - lo < self.MIN_SPAN_V:
+            mid = (hi + lo) / 2
+            lo, hi = mid - self.MIN_SPAN_V / 2, mid + self.MIN_SPAN_V / 2
+        pad = (hi - lo) * 0.08
+        lo, hi = lo - pad, hi + pad
+
+        def ymap(v):
+            return y1 - (v - lo) / (hi - lo) * (y1 - y0)
+
+        ticks, decimals = nice_ticks(lo, hi, 5)
+        for v in ticks:
+            y = ymap(v)
+            c.create_line(x0, y, x1, y, fill="#eee")
+            c.create_text(x0 - 6, y, text=f"{v:.{decimals}f}", anchor="e", fill="#333")
+        c.create_text(12, (y0 + y1) / 2, text="Voltage (V)", angle=90, fill="#333")
+
+        # One min/max pair per pixel column, so spikes stay visible however many samples there are.
+        points = []
+        col = col_lo = col_hi = None
+        for t, v in zip(self.times, self.volts):
+            px = int(xmap(t))
+            if px != col:
+                if col is not None:
+                    points += [col, ymap(col_lo), col, ymap(col_hi)]
+                col, col_lo, col_hi = px, v, v
+            else:
+                col_lo, col_hi = min(col_lo, v), max(col_hi, v)
+        points += [col, ymap(col_lo), col, ymap(col_hi)]
+        c.create_line(*points, fill=self.TRACE)
+
+        if self.mean is not None:
+            y = ymap(self.mean)
+            c.create_line(x0, y, x1, y, fill=self.MEAN, dash=(5, 3), width=2)
+            c.create_text(x1 - 4, y - 3, text=f"mean {self.mean:.5f} V", anchor="se", fill=self.MEAN)
+
+
 class CalibrationApp:
     def __init__(self, root):
         self.root = root
@@ -58,6 +157,8 @@ class CalibrationApp:
         self.events = queue.Queue()  # (kind, payload) from worker threads
         self.trial = None            # settings of the trial being recorded
         self.record_start = None
+        self.live_times, self.live_volts = [], []
+        self.plot_tick = 0
         self._build_ui()
         self.refresh_ports()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -115,8 +216,13 @@ class CalibrationApp:
         self.progress_var = tk.StringVar()
         ttk.Label(trial, textvariable=self.progress_var).grid(row=4, column=1, columnspan=4, sticky="w", **pad)
 
+        live = ttk.LabelFrame(self.root, text="Live trace")
+        live.grid(row=2, column=0, sticky="nsew", **pad)
+        self.plot = LivePlot(live)
+        self.plot.pack(fill="both", expand=True, padx=4, pady=4)
+
         result = ttk.LabelFrame(self.root, text="Last trial")
-        result.grid(row=2, column=0, sticky="ew", **pad)
+        result.grid(row=3, column=0, sticky="ew", **pad)
         big = ("TkDefaultFont", 16, "bold")
         self.mean_var = tk.StringVar(value="Mean: -")
         self.std_var = tk.StringVar(value="Std: -")
@@ -126,16 +232,17 @@ class CalibrationApp:
         ttk.Label(result, textvariable=self.info_var).grid(row=1, column=0, columnspan=2, sticky="w", **pad)
 
         history = ttk.LabelFrame(self.root, text="This session")
-        history.grid(row=3, column=0, sticky="nsew", **pad)
+        history.grid(row=4, column=0, sticky="nsew", **pad)
         cols = ("time", "channel", "water", "dye", "fraction", "mean", "std", "n")
         headings = ("Time", "Channel", "Water (mL)", "Dye (mL)", "Dye fraction",
                     "Mean (V)", "Std (mV)", "N")
-        self.table = ttk.Treeview(history, columns=cols, show="headings", height=8)
+        self.table = ttk.Treeview(history, columns=cols, show="headings", height=5)
         for col, heading in zip(cols, headings):
             self.table.heading(col, text=heading)
             self.table.column(col, width=95, anchor="center")
         self.table.grid(row=0, column=0, sticky="nsew")
-        self.root.rowconfigure(3, weight=1)
+        self.root.rowconfigure(2, weight=3)
+        self.root.rowconfigure(4, weight=1)
         self.root.columnconfigure(0, weight=1)
         history.rowconfigure(0, weight=1)
         history.columnconfigure(0, weight=1)
@@ -234,15 +341,18 @@ class CalibrationApp:
         }
         self.record_btn.config(state="disabled")
         self.connect_btn.config(state="disabled")
+        # The worker appends samples to these lists; poll_events plots them as they grow.
+        self.live_times, self.live_volts = [], []
+        self.plot.reset(duration)
         self.record_start = time.monotonic()
         threading.Thread(target=self._record_worker,
-                         args=(CHANNELS[channel], duration), daemon=True).start()
+                         args=(CHANNELS[channel], duration, self.live_times, self.live_volts),
+                         daemon=True).start()
 
-    def _record_worker(self, channel, duration):
+    def _record_worker(self, channel, duration, times, volts):
         try:
             self.ser.reset_input_buffer()
             self.ser.write(f"R {channel} {int(duration * 1000)}\n".encode())
-            times, volts = [], []
             started = False
             expected = None
             deadline = time.monotonic() + duration + 5
@@ -260,8 +370,9 @@ class CalibrationApp:
                     expected = int(line.split()[1])
                 elif started:
                     t_us, v = line.split(",")
-                    times.append(int(t_us) / 1e6)
-                    volts.append(float(v))
+                    t_s, v_V = int(t_us) / 1e6, float(v)
+                    times.append(t_s)   # times first, so len(volts) never exceeds len(times)
+                    volts.append(v_V)
             if len(volts) != expected:
                 raise RuntimeError(f"Received {len(volts)} of {expected} samples; "
                                    "the trial was not saved. Try again.")
@@ -305,6 +416,7 @@ class CalibrationApp:
                 "file": name,
             })
 
+        self.plot.set_data(times, volts, mean)
         self.mean_var.set(f"Mean: {mean:.5f} V")
         self.std_var.set(f"Std: {std * 1000:.3f} mV")
         self.info_var.set(f"{t['channel']}, {t['water_text']} mL water + {t['dye_text']} mL dye "
@@ -353,6 +465,10 @@ class CalibrationApp:
         if self.record_start is not None:
             elapsed = min(time.monotonic() - self.record_start, self.trial["duration"])
             self.progress_var.set(f"Recording... {elapsed:.1f} / {self.trial['duration']:g} s")
+            self.plot_tick = (self.plot_tick + 1) % 2  # redraw every other poll, ~10 Hz
+            if self.plot_tick == 0:
+                n = len(self.live_volts)
+                self.plot.set_data(self.live_times[:n], self.live_volts[:n])
 
         self.root.after(50, self.poll_events)
 
