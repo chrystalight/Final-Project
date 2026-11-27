@@ -1,0 +1,2 @@
+recorded_at,channel,water_mL,dye_mL,dye_fraction,mean_V,std_V,n_samples,sample_rate_Hz,file
+2026-11-26T14:32:06,A0,2.417,0.583,0.194333,0.557236,0.000877,1565,156.5,A0_2.417mLwater_0.583mLdye_20261126-143206.csv
