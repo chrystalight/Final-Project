@@ -27,7 +27,7 @@ const uint8_t LED_PINS[NUM_CHANNELS] = {8, 9};
 //   GAIN_ONE +/-4.096 V, GAIN_TWO +/-2.048 V, GAIN_FOUR +/-1.024 V, ...
 const adsGain_t GAINS[NUM_CHANNELS] = {GAIN_ONE, GAIN_ONE};
 
-const unsigned long MAX_DURATION_MS = 60000;
+const unsigned long MAX_DURATION_MS = 300000;  // 5 min, long enough for an injection to wash out
 
 Adafruit_ADS1115 ads;
 char cmdBuf[32];
